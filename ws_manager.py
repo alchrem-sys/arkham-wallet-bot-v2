@@ -8,6 +8,14 @@ from config import ARKHAM_API_KEY, ARKHAM_WS_URL
 
 logger = logging.getLogger(__name__)
 
+_sub_counter = 0
+
+
+def _next_id() -> str:
+    global _sub_counter
+    _sub_counter += 1
+    return str(_sub_counter)
+
 
 class WalletStreamManager:
     def __init__(self, on_transfer: Callable[[dict], Awaitable[None]]):
@@ -53,10 +61,13 @@ class WalletStreamManager:
             return
         addrs = list(self._addresses)
         msg = json.dumps({
+            "id": _next_id(),
             "type": "subscribe",
-            "filters": {
-                "from": addrs,
-                "to": addrs,
+            "payload": {
+                "filters": {
+                    "from": addrs,
+                    "to": addrs,
+                }
             },
         })
         await self._ws.send(msg)
@@ -65,9 +76,12 @@ class WalletStreamManager:
     async def _ws_loop(self) -> None:
         while True:
             try:
-                url = f"{ARKHAM_WS_URL}?api_key={ARKHAM_API_KEY}"
+                headers = {"API-Key": ARKHAM_API_KEY}
+                ws_ver = tuple(int(x) for x in websockets.__version__.split(".")[:2])
+                hdr_kwarg = "additional_headers" if ws_ver >= (13, 0) else "extra_headers"
                 async with websockets.connect(
-                    url,
+                    ARKHAM_WS_URL,
+                    **{hdr_kwarg: headers},
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
@@ -80,11 +94,16 @@ class WalletStreamManager:
                             data = json.loads(raw)
                             msg_type = data.get("type", "")
                             if msg_type == "transfer":
-                                asyncio.create_task(
-                                    self._safe_handle(data.get("data", {}))
-                                )
+                                payload = data.get("payload", {})
+                                transfer = payload.get("transfer", {})
+                                if transfer:
+                                    asyncio.create_task(
+                                        self._safe_handle(transfer)
+                                    )
                             elif msg_type == "error":
                                 logger.error(f"WS error: {data}")
+                            elif msg_type == "subscribed":
+                                logger.info(f"WS subscription confirmed: {data}")
                         except json.JSONDecodeError:
                             pass
             except asyncio.CancelledError:
