@@ -65,10 +65,9 @@ class WalletStreamManager:
     async def _ws_loop(self) -> None:
         while True:
             try:
-                headers = {"API-Key": ARKHAM_API_KEY}
+                url = f"{ARKHAM_WS_URL}?api_key={ARKHAM_API_KEY}"
                 async with websockets.connect(
-                    ARKHAM_WS_URL,
-                    extra_headers=headers,
+                    url,
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
