@@ -107,8 +107,14 @@ class WalletStreamManager:
             except asyncio.CancelledError:
                 logger.info("WS loop cancelled")
                 break
+            except websockets.exceptions.InvalidStatusCode as e:
+                logger.warning(
+                    f"WS rejected: HTTP {e.status_code}, "
+                    f"headers sent: API-Key={ARKHAM_API_KEY[:8]}***, "
+                    f"url={ARKHAM_WS_URL}, reconnecting in {self._backoff}s"
+                )
             except Exception as e:
-                logger.warning(f"WS disconnected: {e}, reconnecting in {self._backoff}s")
+                logger.warning(f"WS disconnected: {type(e).__name__}: {e}, reconnecting in {self._backoff}s")
                 self._ws = None
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, 30)
