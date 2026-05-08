@@ -68,7 +68,7 @@ class WalletStreamManager:
                 headers = {"API-Key": ARKHAM_API_KEY}
                 async with websockets.connect(
                     ARKHAM_WS_URL,
-                    additional_headers=headers,
+                    extra_headers=headers,
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
