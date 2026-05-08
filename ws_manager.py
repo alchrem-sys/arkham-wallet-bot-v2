@@ -77,11 +77,9 @@ class WalletStreamManager:
         while True:
             try:
                 headers = {"API-Key": ARKHAM_API_KEY}
-                ws_ver = tuple(int(x) for x in websockets.__version__.split(".")[:2])
-                hdr_kwarg = "additional_headers" if ws_ver >= (13, 0) else "extra_headers"
                 async with websockets.connect(
                     ARKHAM_WS_URL,
-                    **{hdr_kwarg: headers},
+                    extra_headers=headers,
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
