@@ -13,21 +13,13 @@ MULTISIG_KEYWORDS = {"gnosis", "safe", "multisig", "multi-sig"}
 MIXER_KEYWORDS = {"tornado", "mixer", "railgun", "aztec"}
 BRIDGE_KEYWORDS = {"bridge", "wormhole", "stargate", "layerzero", "hop", "across"}
 
-NATIVE_TOKENS = {"eth", "bnb", "matic", "pol", "avax"}
-STABLE_TOKENS = {"usdt", "usdc", "dai", "busd", "tusd", "usdd", "frax", "lusd", "gusd", "pyusd"}
-LEGIT_TOKENS = NATIVE_TOKENS | STABLE_TOKENS | {
-    "weth", "wbtc", "btcb", "steth", "wsteth", "cbeth", "reth",
-    "link", "uni", "aave", "mkr", "snx", "crv", "ldo", "arb",
-    "op", "pendle", "gmx", "grt", "ens", "dydx", "comp", "sushi",
-    "pepe", "shib", "doge", "floki", "bonk",
-    "sol", "ape", "blur", "mana", "sand",
-}
-
-
-def _is_legit_token(symbol: str) -> bool:
+def _is_scam_token(symbol: str) -> bool:
     if not symbol:
-        return False
-    return symbol.lower() in LEGIT_TOKENS
+        return True
+    for ch in symbol:
+        if ord(ch) > 127:
+            return True
+    return False
 
 
 def _is_fresh(addr_obj: dict | None) -> bool:
@@ -165,7 +157,7 @@ async def analyze_wallet(address: str, days: int = 7, min_usd: float = MIN_USD) 
         if usd < min_usd:
             continue
 
-        if not _is_legit_token(token):
+        if _is_scam_token(token):
             continue
 
         is_out = from_addr == watched
