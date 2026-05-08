@@ -6,10 +6,28 @@ from config import ARKHAM_CHAIN_MAP
 
 logger = logging.getLogger(__name__)
 
-CEX_TYPES = {"cex", "exchange", "dex"}
+MIN_USD = 10_000
+
+CEX_TYPES = {"cex", "exchange"}
 MULTISIG_KEYWORDS = {"gnosis", "safe", "multisig", "multi-sig"}
 MIXER_KEYWORDS = {"tornado", "mixer", "railgun", "aztec"}
 BRIDGE_KEYWORDS = {"bridge", "wormhole", "stargate", "layerzero", "hop", "across"}
+
+NATIVE_TOKENS = {"eth", "bnb", "matic", "pol", "avax"}
+STABLE_TOKENS = {"usdt", "usdc", "dai", "busd", "tusd", "usdd", "frax", "lusd", "gusd", "pyusd"}
+LEGIT_TOKENS = NATIVE_TOKENS | STABLE_TOKENS | {
+    "weth", "wbtc", "btcb", "steth", "wsteth", "cbeth", "reth",
+    "link", "uni", "aave", "mkr", "snx", "crv", "ldo", "arb",
+    "op", "pendle", "gmx", "grt", "ens", "dydx", "comp", "sushi",
+    "pepe", "shib", "doge", "floki", "bonk",
+    "sol", "ape", "blur", "mana", "sand",
+}
+
+
+def _is_legit_token(symbol: str) -> bool:
+    if not symbol:
+        return False
+    return symbol.lower() in LEGIT_TOKENS
 
 
 def _is_fresh(addr_obj: dict | None) -> bool:
@@ -36,6 +54,17 @@ def _is_cex(addr_obj: dict | None) -> bool:
         if cex in name or cex in label_name:
             return True
     return False
+
+
+def _is_dex(addr_obj: dict | None) -> bool:
+    if not addr_obj:
+        return False
+    entity = addr_obj.get("arkhamEntity") or {}
+    label = addr_obj.get("arkhamLabel") or {}
+    text = f"{entity.get('name', '')} {label.get('name', '')}".lower()
+    dex_names = {"uniswap", "sushiswap", "pancakeswap", "1inch", "paraswap",
+                 "0x", "curve", "balancer", "dodo", "trader joe", "camelot"}
+    return any(d in text for d in dex_names)
 
 
 def _is_multisig(addr_obj: dict | None) -> bool:
@@ -91,11 +120,13 @@ class AnalysisResult:
     entity: str | None
     total_usd: float
     total_transfers: int
+    scanned_transfers: int
     flagged: list[FlaggedTransfer]
     summary: dict[str, int] = field(default_factory=dict)
+    token_flows: dict[str, dict] = field(default_factory=dict)
 
 
-async def analyze_wallet(address: str, days: int = 7) -> AnalysisResult | None:
+async def analyze_wallet(address: str, days: int = 7, min_usd: float = MIN_USD) -> AnalysisResult | None:
     from datetime import datetime, timezone, timedelta
     time_gte = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -118,6 +149,7 @@ async def analyze_wallet(address: str, days: int = 7) -> AnalysisResult | None:
     watched = address.lower()
     flagged: list[FlaggedTransfer] = []
     summary: dict[str, int] = {}
+    token_flows: dict[str, dict] = {}
 
     for tx in transfers:
         from_obj = tx.get("fromAddress") or {}
@@ -125,43 +157,63 @@ async def analyze_wallet(address: str, days: int = 7) -> AnalysisResult | None:
         from_addr = (from_obj.get("address") or "").lower()
         to_addr = (to_obj.get("address") or "").lower()
         usd = float(tx.get("historicalUSD") or 0)
+        token = tx.get("tokenSymbol") or ""
         chain = tx.get("chain", "ethereum")
         chain_id = ARKHAM_CHAIN_MAP.get(chain, "0x1")
+        amount = float(tx.get("unitValue") or 0)
+
+        if usd < min_usd:
+            continue
+
+        if not _is_legit_token(token):
+            continue
 
         is_out = from_addr == watched
         is_in = to_addr == watched
 
+        # Track token flows
+        tk = token.upper()
+        if tk not in token_flows:
+            token_flows[tk] = {"out_usd": 0, "in_usd": 0, "out_count": 0, "in_count": 0}
+        if is_out:
+            token_flows[tk]["out_usd"] += usd
+            token_flows[tk]["out_count"] += 1
+        if is_in:
+            token_flows[tk]["in_usd"] += usd
+            token_flows[tk]["in_count"] += 1
+
+        # Skip DEX/router swaps — not suspicious
+        if _is_dex(to_obj) or _is_dex(from_obj):
+            continue
+
         flags: list[str] = []
 
         if is_out:
-            if _is_fresh(to_obj):
-                flags.append("🆕 → Fresh wallet")
             if _is_cex(to_obj):
-                flags.append("🏦 → Exchange deposit")
-            if _is_mixer(to_obj):
+                flags.append("🏦 → CEX")
+            elif _is_mixer(to_obj):
                 flags.append("🌀 → Mixer")
-            if _is_bridge(to_obj):
+            elif _is_bridge(to_obj):
                 flags.append("🌉 → Bridge")
-            if _is_multisig(from_obj) and _is_fresh(to_obj):
-                flags.append("🔐 Multisig → Fresh")
+            elif _is_fresh(to_obj):
+                if _is_multisig(from_obj):
+                    flags.append("🔐 Multisig → Fresh")
+                else:
+                    flags.append("🆕 → Fresh wallet")
 
         if is_in:
-            if _is_fresh(from_obj):
-                flags.append("🆕 ← From fresh wallet")
             if _is_mixer(from_obj):
-                flags.append("🌀 ← From mixer")
-            if _is_multisig(from_obj):
-                flags.append("🔐 ← From multisig")
-
-        if usd >= 50000:
-            flags.append("💰 Large transfer")
+                flags.append("🌀 ← Mixer")
+            elif _is_multisig(from_obj):
+                flags.append("🔐 ← Multisig")
+            elif _is_fresh(from_obj):
+                flags.append("🆕 ← Fresh wallet")
 
         if not flags:
             continue
 
         for f in flags:
-            tag = f.split(" ")[0] + " " + f.split(" ", 1)[1] if " " in f else f
-            summary[tag] = summary.get(tag, 0) + 1
+            summary[f] = summary.get(f, 0) + 1
 
         flagged.append(FlaggedTransfer(
             tx_hash=tx.get("transactionHash", ""),
@@ -171,8 +223,8 @@ async def analyze_wallet(address: str, days: int = 7) -> AnalysisResult | None:
             to_addr=to_addr,
             from_label=_get_label(from_obj),
             to_label=_get_label(to_obj),
-            token=tx.get("tokenSymbol") or "ETH",
-            amount=float(tx.get("unitValue") or 0),
+            token=tk,
+            amount=amount,
             usd=usd,
             timestamp=tx.get("blockTimestamp", ""),
             flags=flags,
@@ -183,6 +235,8 @@ async def analyze_wallet(address: str, days: int = 7) -> AnalysisResult | None:
         entity=entity,
         total_usd=total_usd,
         total_transfers=len(transfers),
+        scanned_transfers=sum(1 for tx in transfers if float(tx.get("historicalUSD") or 0) >= min_usd),
         flagged=flagged,
         summary=summary,
+        token_flows=token_flows,
     )

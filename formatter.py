@@ -4,7 +4,6 @@ ARKHAM_ADDR = "https://intel.arkm.com/explorer/address/{}"
 
 
 def short_addr(addr: str) -> str:
-    addr = addr.lower()
     return f"{addr[:6]}...{addr[-4:]}"
 
 
@@ -12,17 +11,17 @@ def fmt_usd(val: float) -> str:
     if val >= 1_000_000:
         return f"${val / 1_000_000:.2f}M"
     if val >= 1_000:
-        return f"${val / 1_000:.2f}K"
-    return f"${val:,.2f}"
+        return f"${val / 1_000:.1f}K"
+    return f"${val:,.0f}"
 
 
 def fmt_amount(val: float) -> str:
     if val >= 1_000_000:
         return f"{val / 1_000_000:.2f}M"
     if val >= 1_000:
-        return f"{val / 1_000:.2f}K"
-    if val < 0.0001:
-        return f"{val:.8f}"
+        return f"{val / 1_000:.1f}K"
+    if val < 0.01:
+        return f"{val:.6f}"
     if val < 1:
         return f"{val:.4f}"
     return f"{val:,.2f}"
@@ -40,26 +39,42 @@ def tx_link(chain_id: str, tx_hash: str) -> str:
 
 
 def format_analysis(result) -> list[str]:
-    from analyzer import AnalysisResult, FlaggedTransfer
+    from analyzer import AnalysisResult
     r: AnalysisResult = result
 
     title = arkham_link(r.address, r.entity)
     messages = []
 
-    # Header message
     lines = [
-        f"🔍 <b>Wallet Analysis</b>",
+        f"🔍 <b>Wallet Analysis</b> (7d, $10K+)",
         f"{title}",
         f"<code>{r.address.lower()}</code>",
         "",
         f"💰 Balance: <b>{fmt_usd(r.total_usd)}</b>",
-        f"📊 Transfers (7d): <b>{r.total_transfers}</b>",
+        f"📊 Total txs: {r.total_transfers} · Scanned ($10K+): {r.scanned_transfers}",
         f"⚠️ Flagged: <b>{len(r.flagged)}</b>",
     ]
 
+    # Token flow summary
+    if r.token_flows:
+        lines.append("")
+        lines.append("<b>Token flows ($10K+):</b>")
+        sorted_tokens = sorted(
+            r.token_flows.items(),
+            key=lambda x: x[1]["out_usd"] + x[1]["in_usd"],
+            reverse=True,
+        )
+        for token, flow in sorted_tokens[:10]:
+            parts = []
+            if flow["out_usd"] > 0:
+                parts.append(f"📤 {fmt_usd(flow['out_usd'])} ({flow['out_count']})")
+            if flow["in_usd"] > 0:
+                parts.append(f"📥 {fmt_usd(flow['in_usd'])} ({flow['in_count']})")
+            lines.append(f"  <b>{token}</b>: {' · '.join(parts)}")
+
     if r.summary:
         lines.append("")
-        lines.append("<b>Summary:</b>")
+        lines.append("<b>Flags:</b>")
         for flag, count in sorted(r.summary.items(), key=lambda x: x[1], reverse=True):
             lines.append(f"  {flag}: <b>{count}</b>")
 
@@ -71,11 +86,11 @@ def format_analysis(result) -> list[str]:
 
     messages.append("\n".join(lines))
 
-    # Group flagged transfers into messages (Telegram 4096 char limit)
+    # Flagged transfers grouped by messages
     watched = r.address.lower()
     chunk_lines = []
 
-    for i, ft in enumerate(r.flagged[:50]):
+    for ft in r.flagged[:40]:
         is_out = ft.from_addr == watched
         arrow = "📤" if is_out else "📥"
 
@@ -87,32 +102,22 @@ def format_analysis(result) -> list[str]:
             direction = f"← {counterparty}"
 
         amount_str = fmt_amount(ft.amount) if ft.amount else ""
-        usd_str = f" ({fmt_usd(ft.usd)})" if ft.usd > 0 else ""
-
-        tx = tx_link(ft.chain_id, ft.tx_hash)
         chain_name = CHAIN_NAMES.get(ft.chain_id, ft.chain)
-
-        ts = ""
-        if ft.timestamp:
-            ts = ft.timestamp[:10]
-
+        tx = tx_link(ft.chain_id, ft.tx_hash)
+        ts = ft.timestamp[:10] if ft.timestamp else ""
         flag_str = " · ".join(ft.flags)
 
-        entry = [
-            f"{arrow} <b>{amount_str} {ft.token}</b>{usd_str}",
-            f"  {direction}  {tx}  <i>{chain_name}</i>",
-            f"  {flag_str}",
-        ]
-        if ts:
-            entry[0] = f"{ts}  {entry[0]}"
+        entry = (
+            f"{ts}  {arrow} <b>{amount_str} {ft.token}</b> ({fmt_usd(ft.usd)})\n"
+            f"  {direction}  {tx}  <i>{chain_name}</i>\n"
+            f"  {flag_str}"
+        )
 
-        candidate = "\n".join(entry)
-
-        if sum(len(l) for l in chunk_lines) + len(candidate) + 10 > 3800:
+        if sum(len(l) for l in chunk_lines) + len(entry) + 10 > 3800:
             messages.append("\n\n".join(chunk_lines))
             chunk_lines = []
 
-        chunk_lines.append(candidate)
+        chunk_lines.append(entry)
 
     if chunk_lines:
         messages.append("\n\n".join(chunk_lines))
