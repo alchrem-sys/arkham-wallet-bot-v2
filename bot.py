@@ -19,7 +19,7 @@ import config
 import formatter
 import arkham_api
 import storage
-from ws_manager import WalletStreamManager
+from poll_manager import TransferPollManager
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -35,7 +35,7 @@ DUST_USD_THRESHOLD = 0.10
 BATCH_WINDOW_SECONDS = 1
 
 _app: Application | None = None
-_ws_manager: WalletStreamManager | None = None
+_poll_manager: TransferPollManager | None = None
 _pending_batches: dict[tuple[int, str], dict] = {}
 
 # Cooldown for wallet total refresh (Arkham API calls)
@@ -74,82 +74,40 @@ def parse_wallet_message(text: str) -> tuple[str, str | None, float | None] | No
     return address, name, threshold
 
 
-# ─── Arkham WebSocket transfer handler ─────────────────────────────────────────
+# ─── Transfer handler (from poll_manager) ─────────────────────────────────────
 
-def _extract_label(addr_obj: dict) -> str | None:
-    if not addr_obj:
-        return None
-    label = addr_obj.get("arkhamLabel")
-    if label and isinstance(label, dict) and label.get("name"):
-        return label["name"]
-    entity = addr_obj.get("arkhamEntity")
-    if entity and isinstance(entity, dict) and entity.get("name"):
-        return entity["name"]
-    return None
-
-
-async def on_arkham_transfer(data: dict) -> None:
+async def on_transfer(event: dict, watched_address: str) -> None:
     if not _app:
         return
 
-    tx_hash = data.get("transactionHash", "")
+    tx_hash = event.get("hash", "")
     if not tx_hash:
         return
 
-    chain_name = data.get("chain", "ethereum")
-    chain_id = config.ARKHAM_CHAIN_MAP.get(chain_name, "0x1")
+    value_usd = float(event.get("value_usd") or 0)
+    token_symbol = event.get("token_symbol", "")
+    amount = event.get("amount", 0)
+    if isinstance(amount, (int, float)):
+        event["amount"] = formatter.fmt_amount(amount) if amount else "0"
 
-    from_obj = data.get("fromAddress") or {}
-    to_obj = data.get("toAddress") or {}
-    from_addr = (from_obj.get("address") or "").lower()
-    to_addr = (to_obj.get("address") or "").lower()
-
-    token_symbol = data.get("tokenSymbol", "")
-    value_usd = float(data.get("historicalUSD") or 0)
-    unit_value_str = str(data.get("unitValue") or "0")
-    try:
-        unit_value = float(unit_value_str)
-    except (ValueError, TypeError):
-        unit_value = 0.0
-
-    if value_usd > 0 and value_usd < DUST_USD_THRESHOLD:
+    addr = watched_address.lower()
+    subscribers = await storage.get_subscribers(addr)
+    if not subscribers:
         return
 
-    from_label = _extract_label(from_obj)
-    to_label = _extract_label(to_obj)
+    dedup_key = f"tx-addr:{tx_hash}:{addr}"
+    if await storage.is_event_seen(dedup_key):
+        return
 
-    event = {
-        "hash": tx_hash,
-        "chain_id": chain_id,
-        "from": from_addr,
-        "to": to_addr,
-        "token_symbol": token_symbol or config.CHAIN_NATIVE.get(chain_id, "ETH"),
-        "amount": formatter.fmt_amount(unit_value) if unit_value else "0",
-        "value_usd": value_usd,
-        "from_label": from_label,
-        "to_label": to_label,
-    }
+    logger.info(f"NOTIFY {tx_hash[:14]}/{addr[:10]}: {token_symbol} ${value_usd:.2f}")
 
-    for addr in (from_addr, to_addr):
-        if not addr:
+    for chat_id in subscribers:
+        threshold = await storage.get_wallet_threshold(chat_id, addr)
+        if threshold is not None and value_usd < threshold:
             continue
-        subscribers = await storage.get_subscribers(addr)
-        if not subscribers:
-            continue
+        await enqueue_batch(chat_id, addr, [event])
 
-        dedup_key = f"tx-addr:{tx_hash}:{addr}"
-        if await storage.is_event_seen(dedup_key):
-            continue
-
-        logger.info(f"NOTIFY {tx_hash[:14]}/{addr[:10]}: {token_symbol} ${value_usd:.2f}")
-
-        for chat_id in subscribers:
-            threshold = await storage.get_wallet_threshold(chat_id, addr)
-            if threshold is not None and value_usd < threshold:
-                continue
-            await enqueue_batch(chat_id, addr, [event])
-
-        asyncio.create_task(_maybe_refresh_total(addr))
+    asyncio.create_task(_maybe_refresh_total(addr))
 
 
 # ─── Batch & send ──────────────────────────────────────────────────────────────
@@ -325,8 +283,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     elif data.startswith("rm:"):
         _, addr, page = data.split(":", 2)
         no_more_subs = await storage.remove_wallet(chat_id, addr)
-        if no_more_subs and _ws_manager:
-            await _ws_manager.remove_address(addr)
+        if no_more_subs and _poll_manager:
+            await _poll_manager.remove_address(addr)
         text, kb = await _menu_text_and_kb(chat_id, int(page))
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -437,8 +395,8 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     no_more_subs = await storage.remove_wallet(chat_id, address)
-    if no_more_subs and _ws_manager:
-        await _ws_manager.remove_address(address)
+    if no_more_subs and _poll_manager:
+        await _poll_manager.remove_address(address)
     await update.message.reply_text(
         f"✅ Stopped tracking <code>{formatter.short_addr(address)}</code>",
         parse_mode=ParseMode.HTML,
@@ -541,8 +499,8 @@ async def handle_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await storage.set_wallet_total_usd(address, total)
     await storage.add_wallet(chat_id, address, name=name, threshold=threshold)
 
-    if _ws_manager and not is_update:
-        await _ws_manager.add_address(address)
+    if _poll_manager and not is_update:
+        await _poll_manager.add_address(address)
 
     portfolio_text = formatter.format_portfolio(
         address, total, name=name, threshold=threshold,
@@ -555,7 +513,7 @@ async def handle_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # ─── App startup ───────────────────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
-    global _app, _ws_manager
+    global _app, _poll_manager
     _app = app
 
     await app.bot.set_my_commands([
@@ -576,15 +534,15 @@ async def post_init(app: Application) -> None:
     await site.start()
     logger.info(f"Health check on port {config.PORT}")
 
-    # Start WebSocket stream manager
-    _ws_manager = WalletStreamManager(on_transfer=on_arkham_transfer)
-    await _ws_manager.start()
+    # Start transfer polling manager
+    _poll_manager = TransferPollManager(on_transfer=on_transfer)
+    await _poll_manager.start()
 
-    # Hydrate: subscribe to all active wallets
+    # Hydrate: poll all active wallets
     active = await storage.get_all_active_wallets()
     if active:
-        await _ws_manager.set_addresses(set(active))
-        logger.info(f"Hydrated {len(active)} wallets into WS")
+        await _poll_manager.set_addresses(set(active))
+        logger.info(f"Hydrated {len(active)} wallets into poller")
 
 
 def main() -> None:
